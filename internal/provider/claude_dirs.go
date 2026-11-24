@@ -47,11 +47,31 @@ func claudeDirService(dir string) string {
 	return "Claude Code-credentials-" + hex.EncodeToString(sum[:])[:8]
 }
 
+// errClaudeKeychainUnread is a saved Claude account's keychain item that
+// `security` couldn't read, though it may be there: the login keychain out
+// of reach (an ssh session, errSecInteractionNotAllowed, exit 36), locked,
+// or its prompt turned down. What the item holds is unknown, so the file
+// beside it says nothing either: Claude Code empties that file once it
+// keeps the sign-in in the keychain, and an emptied file read in its
+// place was taken for a sign-in Anthropic refused: the account was
+// marked "sign in again" and passed over while Claude Code itself still
+// ran on it.
+var errClaudeKeychainUnread = errors.New("the keychain holding this Claude account's sign-in couldn't be read (out of reach from this session, or locked); nothing was changed")
+
 // readClaudeDir is the sign-in Claude Code keeps in config directory dir,
-// where it looks first: the keychain on a Mac, then the file.
+// where it looks first: the keychain on a Mac, then the file. A keychain
+// that couldn't be read is unknown, not empty (readClaudeDirErr).
 func readClaudeDir(dir string) (claudeCredentials, bool) {
+	c, ok, _ := readClaudeDirErr(dir)
+	return c, ok
+}
+
+// readClaudeDirErr is readClaudeDir, with errClaudeKeychainUnread when the
+// keychain item couldn't be read for any reason other than its not being
+// there: then neither the item nor the file beside it is read.
+func readClaudeDirErr(dir string) (claudeCredentials, bool, error) {
 	if settings.AccountDiscoveryOff() {
-		return claudeCredentials{}, false
+		return claudeCredentials{}, false, nil
 	}
 	if claudeKeychain {
 		out, err := proc.Command("security", "find-generic-password", "-s", claudeDirService(dir), "-a", claudeKeychainAccount(), "-w").Output()
@@ -60,15 +80,18 @@ func readClaudeDir(dir string) (claudeCredentials, bool) {
 			if c, ok := parseClaudeCredentials(b); c.raw != nil {
 				// the item there is the sign-in, emptied or not: Claude
 				// Code reads no file beside it
-				return c, ok
+				return c, ok, nil
 			}
+		} else if !keychainItemMissing(err) {
+			return claudeCredentials{}, false, errClaudeKeychainUnread
 		}
 	}
 	b, err := readAccountFile(filepath.Join(dir, ".credentials.json"))
 	if err != nil {
-		return claudeCredentials{}, false
+		return claudeCredentials{}, false, nil
 	}
-	return parseClaudeCredentials(b)
+	c, ok := parseClaudeCredentials(b)
+	return c, ok, nil
 }
 
 // clearClaudeDir takes the sign-in out of config directory dir, so the one
@@ -449,7 +472,15 @@ func ClaudeTrustFolder(dir string, keys ...string) error {
 // l has. has says the directory holds a sign-in to run on; changed, that l
 // changed.
 func syncClaudeDir(l *savedLogin) (has, changed bool, err error) {
-	c, ok := readClaudeDir(claudeAccountDir(l.User))
+	c, ok, err := readClaudeDirErr(claudeAccountDir(l.User))
+	if err != nil {
+		// unknown: nothing is marked refused, and the caller makes no
+		// directory sign-in from the saved one either — a file there
+		// would be a second holder of the refresh token beside the
+		// keychain's, and whichever refreshed first would sign the
+		// other out
+		return false, false, err
+	}
 	switch {
 	case ok:
 		// a directory sign-in older than the saved one (#6391): the
